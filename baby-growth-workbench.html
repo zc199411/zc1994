@@ -428,6 +428,15 @@ img{display:block}
           <div class="hint">格式 owner/repo，需要是你有写权限的仓库（建议私有仓库）。</div>
         </div>
         <button class="btn block" id="ghSave">保存配置</button>
+        <div class="field" style="margin-top:12px"><label>同步密码（自动同步加密用）</label>
+          <input type="password" id="ghPwd" placeholder="设置一个加密密码" autocomplete="off">
+          <div class="hint">自动同步时数据会用此密码加密后再上传，仓库里只存密文。密码仅存本机，换设备需用同一密码才能解密。</div>
+        </div>
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-top:10px">
+          <label style="font-weight:600;cursor:pointer;display:flex;align-items:center"><input type="checkbox" id="autoSyncChk" style="width:auto;margin-right:8px"> 开启自动同步</label>
+          <span id="autoStatus" style="font-size:12px;color:#888">未开启</span>
+        </div>
+        <div class="hint" style="margin-top:6px">开启后：数据有变动会自动加密上传到云端 <code>sync/autosave.json</code>；打开网页时自动拉取合并。加密采用 AES-GCM（不支持的环境降级为异或），公开仓库也看不到明文。</div>
       </div>
 
       <div class="f2" style="gap:14px">
@@ -714,7 +723,7 @@ function toast(msg,type){var t=$('#toast');t.className='toast on'+(type?' '+type
 /* ==========================================================
    数据层
    ========================================================== */
-var LS_KEY='babyWorkbench_v1', LS_GH='babyWorkbench_github';
+var LS_KEY='babyWorkbench_v1', LS_GH='babyWorkbench_github', LS_SYNC='babyWorkbench_autosync';
 var DEFAULT_DATA={profile:{name:'',gender:'boy',birthday:'',avatar:''},meals:{},vaccines:{},growth:[],milestones:[],allergens:[],dailyRecords:[],travels:[],favoriteGames:[]};
 var appData=JSON.parse(JSON.stringify(DEFAULT_DATA));
 
@@ -728,7 +737,7 @@ function loadData(){
   if(!appData.vaccines||typeof appData.vaccines!=='object')appData.vaccines={};
   ['growth','milestones','allergens','dailyRecords','travels','favoriteGames'].forEach(function(k){if(!Array.isArray(appData[k]))appData[k]=[];});
 }
-function saveData(){try{localStorage.setItem(LS_KEY,JSON.stringify(appData));}catch(e){toast('本地存储失败：'+e.message,'err');}}
+function saveData(){try{localStorage.setItem(LS_KEY,JSON.stringify(appData));}catch(e){toast('本地存储失败：'+e.message,'err');} scheduleAutoSync();}
 
 function ageMonths(ref){
   var b=appData.profile.birthday;if(!b)return null;
@@ -1531,7 +1540,10 @@ function mergeAppData(local,remote){
   return out;
 }
 $('#btnSync').addEventListener('click',function(){
-  var c=ghCfg();$('#ghToken').value=c.token||'';$('#ghRepo').value=c.repo||'';
+  var c=ghCfg(),ac=autoCfg();
+  $('#ghToken').value=c.token||'';$('#ghRepo').value=c.repo||'';
+  $('#ghPwd').value=ac.pwd||'';$('#autoSyncChk').checked=!!ac.auto;
+  setAutoStatus(ac.auto?(ac.lastSync?('上次：'+new Date(ac.lastSync).toLocaleString('zh-CN')):'已开启'):'未开启','idle');
   $('#uploadResult').innerHTML='';syncMsg('');
   $('#syncMask').classList.add('on');
 });
@@ -1539,10 +1551,148 @@ $('#ghSave').addEventListener('click',function(){
   var t=$('#ghToken').value.trim(),r=$('#ghRepo').value.trim();
   if(!t||!r){syncMsg('Token 与仓库名都不能为空。','warn');return;}
   if(!/^[\w.-]+\/[\w.-]+$/.test(r)){syncMsg('仓库名格式应为 owner/repo。','warn');return;}
-  ghSaveCfg(t,r);syncMsg('✅ 配置已保存到本机 localStorage。','info');toast('GitHub 配置已保存');
+  ghSaveCfg(t,r);
+  var ac=autoCfg();
+  ac.pwd=$('#ghPwd').value;ac.auto=$('#autoSyncChk').checked;saveAutoCfg(ac);
+  var msg='✅ 配置已保存。';
+  if(ac.auto){
+    if(ac.pwd){msg+=' 自动同步已开启（数据将加密上传）。'; setAutoStatus('已开启，等待数据变更','idle');}
+    else {msg+=' ⚠️ 开启自动同步需设置同步密码。'; setAutoStatus('已关闭','idle');}
+  }
+  syncMsg(msg,'info');toast('GitHub 配置已保存');
+  if(ac.auto&&ac.pwd)autoPush();
 });
 $('#btnUpload').addEventListener('click',doUpload);
 $('#btnDownload').addEventListener('click',doDownload);
+
+/* ==========================================================
+   自动同步（加密）
+   ========================================================== */
+function autoCfg(){try{return JSON.parse(localStorage.getItem(LS_SYNC)||'{}');}catch(e){return {};}}
+function saveAutoCfg(o){localStorage.setItem(LS_SYNC,JSON.stringify(o));}
+function setAutoStatus(text,type){
+  var el=$('#autoStatus');if(!el)return;
+  el.textContent=text||'';
+  el.style.color=type==='ok'?'#2fa36b':type==='err'?'#e0556b':type==='run'?'#e0962f':'#888';
+}
+function bufToB64(buf){var b=new Uint8Array(buf),s='';for(var i=0;i<b.length;i++)s+=String.fromCharCode(b[i]);return btoa(s);}
+function b64ToBuf(b64){var s=atob(String(b64).replace(/\s/g,'')),b=new Uint8Array(s.length);for(var i=0;i<s.length;i++)b[i]=s.charCodeAt(i);return b.buffer;}
+function hasSubtle(){return !!(window.crypto&&window.crypto.subtle&&window.crypto.subtle.encrypt);}
+function aesEncrypt(text,pwd){
+  var enc=new TextEncoder();
+  var salt=crypto.getRandomValues(new Uint8Array(16));
+  var iv=crypto.getRandomValues(new Uint8Array(12));
+  return crypto.subtle.importKey('raw',enc.encode(pwd),'PBKDF2',false,['deriveKey']).then(function(km){
+    return crypto.subtle.deriveKey({name:'PBKDF2',salt:salt,iterations:100000,hash:'SHA-256'},km,{name:'AES-GCM',length:256},false,['encrypt','decrypt']);
+  }).then(function(key){
+    return crypto.subtle.encrypt({name:'AES-GCM',iv:iv},key,enc.encode(text));
+  }).then(function(ct){
+    return {v:1,enc:'aes-gcm',salt:bufToB64(salt.buffer),iv:bufToB64(iv.buffer),data:bufToB64(ct),updatedAt:Date.now()};
+  });
+}
+function aesDecrypt(p,pwd){
+  var dec=new TextDecoder();
+  var salt=new Uint8Array(b64ToBuf(p.salt));
+  var iv=new Uint8Array(b64ToBuf(p.iv));
+  return crypto.subtle.importKey('raw',new TextEncoder().encode(pwd),'PBKDF2',false,['deriveKey']).then(function(km){
+    return crypto.subtle.deriveKey({name:'PBKDF2',salt:salt,iterations:100000,hash:'SHA-256'},km,{name:'AES-GCM',length:256},false,['encrypt','decrypt']);
+  }).then(function(key){
+    return crypto.subtle.decrypt({name:'AES-GCM',iv:iv},key,b64ToBuf(p.data));
+  }).then(function(pt){return dec.decode(pt);});
+}
+function xorCrypt(bytes,pwd){
+  var kb=new TextEncoder().encode(pwd||'x');
+  var out=new Uint8Array(bytes.length);
+  for(var i=0;i<bytes.length;i++)out[i]=bytes[i]^kb[i%kb.length];
+  return out;
+}
+function xorEncrypt(text,pwd){
+  var out=xorCrypt(new TextEncoder().encode(text),pwd);
+  return {v:1,enc:'xor',data:bufToB64(out.buffer),updatedAt:Date.now()};
+}
+function xorDecrypt(p,pwd){
+  var out=xorCrypt(new Uint8Array(b64ToBuf(p.data)),pwd);
+  return new TextDecoder().decode(out);
+}
+function cryptoEncrypt(text,pwd){return hasSubtle()?aesEncrypt(text,pwd):xorEncrypt(text,pwd);}
+function cryptoDecrypt(p,pwd){return p.enc==='aes-gcm'?aesDecrypt(p,pwd):xorDecrypt(p,pwd);}
+
+function ghContentUrl(repo,path){return 'https://api.github.com/repos/'+repo+'/contents/'+path;}
+function ghGet(repo,path){
+  var c=ghCfg();
+  return fetch(ghContentUrl(repo,path),{headers:ghHeaders(c.token)}).then(function(r){
+    if(r.status===404)return null;
+    if(!r.ok)return r.json().then(function(j){throw new Error(j.message||('HTTP '+r.status));});
+    return r.json().then(function(j){return {sha:j.sha,text:base64ToUtf8(j.content)};});
+  });
+}
+function ghPut(repo,path,text,message,sha){
+  var c=ghCfg();
+  var body={message:message,content:utf8ToBase64(text)};
+  if(sha)body.sha=sha;
+  return fetch(ghContentUrl(repo,path),{method:'PUT',headers:ghHeaders(c.token),body:JSON.stringify(body)}).then(function(r){
+    return r.json().then(function(j){if(!r.ok)throw new Error(j.message||('HTTP '+r.status));return j.sha;});
+  });
+}
+var autoBusy=false,autoTimer=null;
+function scheduleAutoSync(){
+  var cfg=autoCfg();
+  if(!cfg.auto)return;
+  clearTimeout(autoTimer);
+  autoTimer=setTimeout(function(){autoPush();},1500);
+}
+function autoPush(){
+  if(autoBusy)return;
+  var cfg=autoCfg(),c=ghCfg();
+  if(!cfg.auto||!c.token||!c.repo||!cfg.pwd)return;
+  autoBusy=true;setAutoStatus('同步中…','run');
+  ghGet(c.repo,'sync/autosave.json').catch(function(){return null;}).then(function(got){
+    var sha=got?got.sha:null;
+    var chain=Promise.resolve();
+    if(got&&got.text){
+      try{
+        var p=JSON.parse(got.text);
+        if(p.enc){
+          chain=chain.then(function(){return cryptoDecrypt(p,cfg.pwd);}).then(function(rd){
+            var before=countAll(appData);
+            appData=mergeAppData(appData,JSON.parse(rd));
+            if(countAll(appData)!==before)saveData();
+          });
+        }
+      }catch(e){console.warn('自动同步：云端数据跳过合并',e);}
+    }
+    return chain.then(function(){return cryptoEncrypt(JSON.stringify(appData),cfg.pwd);}).then(function(enc){
+      return ghPut(c.repo,'sync/autosave.json',JSON.stringify(enc,null,2),'baby auto-sync',sha);
+    }).then(function(newSha){
+      cfg.sha=newSha;cfg.lastSync=Date.now();saveAutoCfg(cfg);
+      setAutoStatus('已同步 · '+new Date(cfg.lastSync).toLocaleTimeString('zh-CN'),'ok');
+    });
+  }).catch(function(e){
+    setAutoStatus('同步失败：'+(e.message||e),'err');
+  }).then(function(){autoBusy=false;});
+}
+function autoPull(){
+  var cfg=autoCfg(),c=ghCfg();
+  if(!cfg.auto||!c.token||!c.repo||!cfg.pwd)return;
+  setAutoStatus('拉取中…','run');
+  ghGet(c.repo,'sync/autosave.json').then(function(got){
+    if(!got||!got.text){setAutoStatus('云端暂无备份','idle');return;}
+    var p=JSON.parse(got.text);
+    if(!p.enc)throw new Error('云端数据非加密格式');
+    return cryptoDecrypt(p,cfg.pwd).then(function(rd){
+      var before=countAll(appData);
+      appData=mergeAppData(appData,JSON.parse(rd));
+      saveData();renderProfile();renderView(currentView);
+      var after=countAll(appData);cfg.sha=got.sha;cfg.lastSync=Date.now();saveAutoCfg(cfg);
+      setAutoStatus('已同步 · '+new Date(cfg.lastSync).toLocaleTimeString('zh-CN'),'ok');
+      if(after!==before)toast('已从云端合并数据'+(after>before?('，新增 '+(after-before)+' 条'):''));
+      else toast('已与云端同步');
+    });
+  }).catch(function(e){
+    if((e&&e.message)==='云端暂无备份')return;
+    setAutoStatus('拉取失败：'+(e.message||e),'err');
+  });
+}
 
 /* ==========================================================
    启动
@@ -1554,6 +1704,8 @@ $('#btnDownload').addEventListener('click',doDownload);
   buildNav();renderProfile();renderCatSeg();
   switchView('feed');
   if(!appData.profile.birthday)setTimeout(function(){toast('先设置宝宝信息，体验更完整 👶','info');},700);
+  if(autoCfg().auto) autoPull();
+  document.addEventListener('visibilitychange',function(){ if(document.visibilityState==='visible') autoPull(); });
 })();
 </script>
 </body>
